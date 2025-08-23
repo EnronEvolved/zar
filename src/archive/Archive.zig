@@ -10,17 +10,17 @@ const fs = std.fs;
 const mem = std.mem;
 const logger = std.log.scoped(.archive);
 const elf = std.elf;
-const Elf = @import("zld/Zld.zig").Elf;
-const MachO = @import("zld/Zld.zig").MachO;
 const macho = std.macho;
-const Coff = @import("zld/Zld.zig").Coff;
+const coff = std.coff;
+// const Elf = @import("zld/Zld.zig").Elf;
+// const MachO = @import("zld/Zld.zig").MachO;
+// const Coff = @import("zld/Zld.zig").Coff;
 // We don't have any kind of bitcode parsing support at the moment, but we need
 // to report dealing with bitcode files as an error. So embed magic like this
 // matching the format of the actual zld package for now.
 const Bitcode = struct {
     const magic = "BC\xC0\xDE";
 };
-const coff = std.coff;
 const tracking_buffered_writer = @import("../tracking_buffered_writer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -33,10 +33,10 @@ file: fs.File,
 name: []const u8,
 created: bool,
 
-// We need to differentiate between inferred and output archive type, as other ar
-// programs "just handle" any valid archive for parsing, regarldess of what a
-// user has specified - the user specification should only matter for writing
-// archives.
+// We need to differentiate between inferred and output archive type,
+// as other ar programs "just handle" any valid archive for parsing,
+// regardless of what a user has specified - the user specification should
+// only matter for writing archives.
 inferred_archive_type: ArchiveType,
 output_archive_type: ArchiveType,
 
@@ -116,8 +116,8 @@ pub const HandledError = HandledIoError || error{
     UnknownFormat,
 };
 
-// We can set this to true just to make Handled errors are actually handled at
-// comptime!
+// We can set this to true just to make Handled errors are actually
+// handled at comptime!
 pub const test_errors_handled = if (@hasField(build_options, "test_errors_handled")) build_options.test_errors_handled else false;
 
 pub const HandledIoError = if (test_errors_handled) error{Handled} else IoError;
@@ -192,7 +192,7 @@ pub const MoveSetting = union(enum) {
 };
 
 pub const Modifiers = struct {
-    // Supress warning for file creation
+    // Suppress warning for file creation
     create: bool = false,
     // Only insert files with more recent timestamps than archive
     update_only: bool = false,
@@ -247,8 +247,9 @@ pub const Symbol = struct {
 // the spec.
 const IntType = i32;
 
-// TODO: This name is confusing because ranlib is also the name of the ranlib
-// program - but also what this struct is traditionally called within archives.
+// TODO: This name is confusing because ranlib is also the name
+// of the ranlib program - but also what this struct is traditionally
+// called within archives.
 // :/
 // type of ranlib used depends on the archive storage format
 fn Ranlib(comptime storage: type) type {
@@ -280,8 +281,10 @@ pub fn printFileIoError(comptime context: ErrorContext, file_name: []const u8, e
     return err;
 }
 
-// The weird return type is so that we can distinguish between handled and unhandled IO errors,
-// i.e. if test_errors_handled is set to true, and raw calls to io operations will return in a compile failure
+// The weird return type is so that we can distinguish between handled
+// and unhandled IO errors,
+// i.e. if test_errors_handled is set to true, and raw calls to
+// io operations will return in a compile failure
 pub fn handleFileIoError(comptime context: ErrorContext, file_name: []const u8, fallible: anytype) HandledIoError!@typeInfo(@TypeOf(fallible)).error_union.payload {
     const unwrapped_result = fallible catch |err| {
         return printFileIoError(context, file_name, err);
@@ -810,11 +813,26 @@ pub fn extract(self: *Archive, file_names: []const []const u8) !void {
     }
 }
 
-pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *const ArchivedFile, file_index: usize, file: fs.File, file_offset: u32) (CriticalError || HandledIoError)!void {
+/// Reads symbols from an ELF, Mach-O, COFF, or LLVM bitcode file
+/// and appends them to `self.symbols`
+pub fn addToSymbolTable(
+    self: *Archive,
+    allocator: Allocator,
+    archived_file: *const ArchivedFile,
+    file_index: usize,
+    file: fs.File,
+    /// Offset from which to begin reading data from `file`
+    file_offset: u32
+) (CriticalError || HandledIoError)!void {
+
+}
+
+pub fn addToSymbolTableOld(self: *Archive, allocator: Allocator, archived_file: *const ArchivedFile, file_index: usize, file: fs.File, file_offset: u32) (CriticalError || HandledIoError)!void {
     // TODO: make this read directly from the file contents buffer!
 
     // Get the file magic
     try handleFileIoError(.seeking, archived_file.name, file.seekTo(file_offset));
+
 
     var magic: [4]u8 = undefined;
     _ = try handleFileIoError(.reading, archived_file.name, file.deprecatedReader().read(&magic));
@@ -823,8 +841,9 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
 
     blk: {
         // TODO: Load object from memory (upstream zld)
-        // TODO(TRC):Now this should assert that the magic number is what we expect it to be
-        // based on the parsed archive type! Not inferring what we should do based on it.
+        // TODO(TRC):Now this should assert that the magic number is
+        // what we expect it to be based on the parsed archive type!
+        // Not inferring what we should do based on it.
         // switch(self.output_archive_type)
         // {
 
@@ -868,7 +887,8 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
             // var bitcode_file = Bitcode{ .file = file, .name = archived_file.name };
             // defer bitcode_file.deinit(allocator);
 
-            // // TODO: Do not use builtin.target like this, be more flexible!
+            // // TODO: Do not use builtin.target like this,
+            // //       be more flexible!
             // bitcode_file.parse(allocator, builtin.target) catch |err| switch (err) {
             //     error.NotObject => break :blk,
             //     else => |e| return e,
@@ -998,7 +1018,7 @@ pub fn insertFiles(self: *Archive, file_names: []const []const u8) (InsertError 
             error.OutOfMemory => return error.OutOfMemory,
             else => @as(IoError, @errorCast(e)),
         };
-        const archived_file = ArchivedFile{ // was var
+        var archived_file = ArchivedFile{
             .name = try allocator.dupe(u8, fs.path.basename(file_name)),
             .contents = Contents{
                 .bytes = try handleFileIoError(.reading, file_name, bytes_or_io_error),
@@ -1010,11 +1030,11 @@ pub fn insertFiles(self: *Archive, file_names: []const []const u8) (InsertError 
             },
         };
 
-        // const file_index = if (self.file_name_to_index.get(file_name)) |file_id| file_id else self.files.items.len;
+        const file_index = if (self.file_name_to_index.get(file_name)) |file_id| file_id else self.files.items.len;
 
         // Read symbols
         if (self.modifiers.build_symbol_table) {
-            // try self.addToSymbolTable(allocator, &archived_file, file_index, file, 0); // Hacking out the zld stuff so this is borked right now.
+            try self.addToSymbolTable(allocator, &archived_file, file_index, file, 0); // Hacking out the zld stuff so this is borked right now.
         }
 
         // A trie-based datastructure would be better for this!
@@ -1437,14 +1457,14 @@ pub fn parse(self: *Archive) (ParseError || HandledIoError || CriticalError)!voi
         }
 
         if (self.modifiers.build_symbol_table) {
-            // const post_offset_hack = try handleFileIoError(.seeking, self.name, reader.context.getPos());
+            const post_offset_hack = try handleFileIoError(.seeking, self.name, reader.context.getPos());
             // TODO: Actually handle these errors!
             // … and get this working in the first place!
-            //self.addToSymbolTable(allocator, &parsed_file, self.files.items.len, reader.context, @as(u32, @intCast(offset_hack))) catch {
-            //    return error.TODO;
-            //};
+            self.addToSymbolTable(allocator, &parsed_file, self.files.items.len, reader.context, @as(u32, @intCast(offset_hack))) catch {
+                return error.TODO;
+            };
 
-            // try handleFileIoError(.seeking, self.name, reader.context.seekTo(post_offset_hack));
+            try handleFileIoError(.seeking, self.name, reader.context.seekTo(post_offset_hack));
         }
 
         try self.file_name_to_index.put(allocator, trimmed_archive_name, self.files.items.len);
