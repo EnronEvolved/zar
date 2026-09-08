@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) !void {
         var code: u8 = undefined;
         const git_describe_untrimmed = b.runAllowFail(&[_][]const u8{
             "git", "-C", b.build_root.path.?, "describe", "--match", "*.*.*", "--tags",
-        }, &code, .Ignore) catch {
+        }, &code, .ignore) catch {
             break :v version_string;
         };
         const git_describe = mem.trim(u8, git_describe_untrimmed, " \n\r");
@@ -137,23 +137,23 @@ pub fn build(b: *std.Build) !void {
             const client_cpp_lazy: std.Build.LazyPath = .{ .src_path = .{ .owner = b, .sub_path = client_cpp } };
             exe_mod.addIncludePath(tracy_lazy_path);
             exe_mod.addCSourceFile(.{ .file = client_cpp_lazy, .flags = tracy_c_flags });
-            exe.linkLibC();
-            exe.linkLibCpp();
+            exe.root_module.link_libc = true;
+            exe.root_module.link_libcpp = true;
 
-            tests.addIncludePath(tracy_lazy_path);
-            tests.addCSourceFile(.{ .file = client_cpp_lazy, .flags = tracy_c_flags });
-            tests.linkLibC();
-            tests.linkLibCpp();
+            tests.root_module.addIncludePath(tracy_lazy_path);
+            tests.root_module.addCSourceFile(.{ .file = client_cpp_lazy, .flags = tracy_c_flags });
+            tests.root_module.link_libc = true;
+            tests.root_module.link_libcpp = true;
 
             if (target.result.os.tag == .windows) {
-                exe.linkSystemLibrary("dbghelp");
-                exe.linkSystemLibrary("ws2_32");
+                exe.root_module.linkSystemLibrary("dbghelp", .{});
+                exe.root_module.linkSystemLibrary("ws2_32", .{});
 
-                tests.linkSystemLibrary("dbghelp");
-                tests.linkSystemLibrary("ws2_32");
+                tests.root_module.linkSystemLibrary("dbghelp", .{});
+                tests.root_module.linkSystemLibrary("ws2_32", .{});
             } else if (target.result.os.tag.isDarwin()) {
-                exe.linkFramework("CoreFoundation");
-                tests.linkFramework("CoreFoundation");
+                exe.root_module.linkFramework("CoreFoundation", .{});
+                tests.root_module.linkFramework("CoreFoundation", .{});
             }
         }
     }

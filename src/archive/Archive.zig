@@ -20,7 +20,7 @@ const allocator_limit = 10000000;
 arena: std.heap.ArenaAllocator,
 gpa: Allocator,
 zar_io: *const ZarIo,
-file: std.fs.File,
+file: std.Io.File,
 name: []const u8,
 created: bool,
 
@@ -31,11 +31,11 @@ created: bool,
 inferred_archive_type: ArchiveType,
 output_archive_type: ArchiveType,
 
-files: std.ArrayListUnmanaged(ArchivedFile),
-symbols: std.ArrayListUnmanaged(Symbol),
+files: std.ArrayList(ArchivedFile),
+symbols: std.ArrayList(Symbol),
 
 // Use it so we can easily lookup files indices when inserting!
-file_name_to_index: std.StringArrayHashMapUnmanaged(u64),
+file_name_to_index: std.array_hash_map.String(u64),
 
 modifiers: Modifiers,
 
@@ -133,7 +133,7 @@ pub const SymbolParseError = error{
     SymbolParseError,
 };
 
-pub const IoError = std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.SeekError || std.fs.File.StatError || std.fs.File.WriteError || std.io.Writer.Error || std.fs.File.Writer.EndError;
+pub const IoError = std.Io.File.OpenError || std.Io.File.ReadPositionalError || std.Io.File.Reader.SeekError || std.Io.File.StatError || std.Io.File.WritePositionalError || std.Io.Writer.Error || std.Io.File.Writer.EndError || std.Io.Reader.LimitedAllocError ;
 
 // All archive files start with this magic string
 pub const magic_string = "!<arch>\n";
@@ -155,7 +155,7 @@ pub const invalid_file_index = std.math.maxInt(u64);
 
 // The format (unparsed) of the archive per-file header
 // NOTE: The reality is more complex than this as different mechanisms
-// have been devised for storing the names of files which exceed 16 byte!
+// have been devised for storing the names of f/iles which exceed 16 byte!
 pub const Header = extern struct {
     ar_name: [16]u8,
     ar_date: [12]u8,
@@ -246,7 +246,7 @@ const ErrorContext = enum {
     writing,
 };
 
-fn calculateLogicPosition(file_writer: *std.fs.File.Writer) usize {
+fn calculateLogicPosition(file_writer: *std.Io.File.Writer) usize {
     return file_writer.pos + file_writer.interface.end;
 }
 
@@ -287,7 +287,7 @@ pub fn getDefaultArchiveTypeFromHost() ArchiveType {
 pub fn init(
     allocator: std.mem.Allocator,
     zar_io: *const ZarIo,
-    file: std.fs.File,
+    file: std.Io.File,
     name: []const u8,
     output_archive_type: ArchiveType,
     modifiers: Modifiers,
@@ -301,9 +301,9 @@ pub fn init(
         .name = name,
         .inferred_archive_type = .ambiguous,
         .output_archive_type = output_archive_type,
-        .files = .{},
-        .symbols = .{},
-        .file_name_to_index = .{},
+        .files = .empty,
+        .symbols = .empty,
+        .file_name_to_index = .empty,
         .modifiers = modifiers,
         .created = created,
     };
@@ -380,11 +380,13 @@ pub fn flush(self: *Archive) (FlushError || HandledIoError || CriticalError)!voi
     }
 
     // Overwrite all contents
-    try handleFileIoError(self.zar_io, .seeking, self.name, self.file.seekTo(0));
+    var reader_buf: [4096]u8 = undefined;
+    var file_reader = self.file.reader(self.zar_io.io, &reader_buf);
+    try handleFileIoError(self.zar_io, .seeking, self.name, file_reader.seekTo(0));
 
     // TODO: figure out strategy for choosing a buffer size here
     var writer_buf: [4096]u8 = undefined;
-    var file_writer = self.file.writer(&writer_buf);
+    var file_writer = self.file.writer(self.zar_io.io, &writer_buf);
     self.flushToWriter(allocator, &file_writer) catch |e| {
         switch (e) {
             error.OutOfMemory => {
@@ -400,14 +402,14 @@ pub fn flush(self: *Archive) (FlushError || HandledIoError || CriticalError)!voi
     };
 }
 
-pub fn flushToWriter(self: *Archive, allocator: std.mem.Allocator, file_writer: *std.fs.File.Writer) !void {
+pub fn flushToWriter(self: *Archive, allocator: std.mem.Allocator, file_writer: *std.Io.File.Writer) !void {
     try file_writer.interface.writeAll(if (self.output_archive_type == .gnuthin) magic_thin else magic_string);
 
     const header_names = try allocator.alloc([16]u8, self.files.items.len);
     defer allocator.free(header_names);
 
     const SortContext = struct {
-        files: std.ArrayListUnmanaged(ArchivedFile),
+        files: std.ArrayList(ArchivedFile),
     };
     const SortFn = struct {
         fn sorter(context: *const SortContext, x: Symbol, y: Symbol) bool {
@@ -468,7 +470,8 @@ pub fn flushToWriter(self: *Archive, allocator: std.mem.Allocator, file_writer: 
     }
 
     // Set the mtime of symbol table to now seconds in non-deterministic mode
-    const symtab_time: u64 = (if (self.modifiers.use_real_timestamps_and_ids) @as(u64, @intCast(std.time.milliTimestamp())) else 0) / 1000;
+    const clock: std.Io.Clock = .real;
+    const symtab_time: u64 = (if (self.modifiers.use_real_timestamps_and_ids) @as(u64, @intCast(clock.now(self.zar_io.io).toMilliseconds())) else 0) / 1000;
 
     switch (self.output_archive_type) {
         .gnu, .gnuthin, .gnu64 => {
@@ -802,7 +805,7 @@ pub fn extract(self: *Archive, file_names: []const []const u8) !void {
     }
 }
 
-pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *const ArchivedFile, file_index: usize) (CriticalError || SymbolParseError)!void {
+pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *const ArchivedFile, file_index: usize) (CriticalError || SymbolParseError )!void {
     const magic = archived_file.contents.bytes[0..4];
 
     blk: {
@@ -818,7 +821,7 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
                 // TODO: double check that this is the correct inference
                 self.output_archive_type = .gnu;
             }
-            var reader = std.io.Reader.fixed(archived_file.contents.bytes);
+            var reader = std.Io.Reader.fixed(archived_file.contents.bytes);
             const header = std.elf.Header.read(&reader) catch {
                 return error.SymbolParseError;
             };
@@ -892,30 +895,27 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
                     self.output_archive_type = .darwin;
                 }
 
-                var reader = std.io.Reader.fixed(archived_file.contents.bytes);
+                var reader = std.Io.Reader.fixed(archived_file.contents.bytes);
                 const header = reader.takeStruct(std.macho.mach_header_64, .little) catch {
                     return error.SymbolParseError;
                 };
 
                 const lc_buffer = try allocator.alloc(u8, header.sizeofcmds);
                 defer allocator.free(lc_buffer);
-                {
-                    const amt = reader.readSliceShort(lc_buffer) catch return error.SymbolParseError;
-                    if (amt != header.sizeofcmds) return error.SymbolParseError;
-                }
+                //{
+                //     const amt = reader.readSliceShort(lc_buffer) catch return error.SymbolParseError;
+                //     if (amt != header.sizeofcmds) return error.SymbolParseError;
+                //}
 
-                var load_command_iterator = std.macho.LoadCommandIterator{
-                    .ncmds = header.ncmds,
-                    .buffer = lc_buffer,
-                };
-                while (load_command_iterator.next()) |load_command| switch (load_command.cmd()) {
+                var load_command_iterator = std.macho.LoadCommandIterator.init(&header, lc_buffer) catch return error.SymbolParseError;
+                while (load_command_iterator.next() catch return error.SymbolParseError) |load_command| switch (load_command.hdr.cmd) {
                     .SYMTAB => {
                         const symtab_command = load_command.cast(std.macho.symtab_command).?;
                         const strtab = archived_file.contents.bytes[symtab_command.stroff..][0..symtab_command.strsize];
                         const symtab_buffer = archived_file.contents.bytes[symtab_command.symoff..][0 .. symtab_command.nsyms * @sizeOf(std.macho.nlist_64)];
                         const symtab = @as([*]align(1) const std.macho.nlist_64, @ptrCast(symtab_buffer.ptr))[0..symtab_command.nsyms];
                         for (symtab) |sym| {
-                            if (sym.ext() and (sym.sect() or sym.tentative())) {
+                            if (sym.n_type.bits.ext and (sym.n_type.bits.type == .sect or sym.tentative())) {
                                 const string = std.mem.sliceTo(strtab[sym.n_strx..], 0);
                                 const symbol = Symbol{
                                     .name = try allocator.dupe(u8, string),
@@ -952,7 +952,7 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
     }
 }
 
-pub fn insertFiles(archive: *Archive, file_names: []const []const u8) (InsertError || HandledIoError || CriticalError || std.fs.File.StatError)!void {
+pub fn insertFiles(archive: *Archive, file_names: []const []const u8) (InsertError || HandledIoError || CriticalError || std.Io.File.StatError)!void {
     const allocator = archive.arena.allocator();
     const zar_io = archive.zar_io;
     const tracy = trace(@src());
@@ -984,59 +984,64 @@ pub fn insertFiles(archive: *Archive, file_names: []const []const u8) (InsertErr
 
 fn insertFile(self: *Archive, allocator: Allocator, file_name: []const u8) !void {
     // Open the file and read all of its contents
-    const file = try self.zar_io.cwd.openFile(file_name, .{ .mode = .read_only });
-    defer file.close();
+    const file = try self.zar_io.cwd.openFile(self.zar_io.io, file_name, .{ .mode = .read_only });
+    defer file.close(self.zar_io.io);
 
     // We only need to do this because file stats don't include
     // guid and uid - maybe the right solution is to integrate that into
     // the std so we can call file.stat() on all platforms.
     var gid: u32 = 0;
     var uid: u32 = 0;
-    var mtime: i128 = 0;
+    var mtime = std.Io.Timestamp.zero;
     var size: u64 = undefined;
     var mode: u64 = undefined;
 
-    // FIXME: Currently windows doesnt support the Stat struct
-    if (builtin.os.tag == .windows) {
-        const file_stats = try file.stat();
-        // Convert timestamp from ns to s
-        mtime = file_stats.mtime;
-        size = file_stats.size;
-        mode = file_stats.mode;
-    } else {
-        const file_stats = try std.posix.fstat(file.handle);
-
-        gid = file_stats.gid;
-        uid = file_stats.uid;
-        const mtime_full = file_stats.mtime();
-        mtime = mtime_full.sec * std.time.ns_per_s + mtime_full.nsec;
-        size = @as(u64, @intCast(file_stats.size));
-        mode = file_stats.mode;
-    }
+    // common details
+    const file_stats = try file.stat(self.zar_io.io);
+    const raw_mtime = file_stats.mtime;
+    size = file_stats.size;
 
     if (self.modifiers.update_only) {
-        const stat = try self.file.stat();
+        const stat = try self.file.stat(self.zar_io.io);
         // TODO: Write a test that checks for this functionality still working!
         // TODO: Is this even correct? Shouldn't it be comparing to mtime in archive already?
-        if (stat.mtime >= mtime and !self.created) {
+        if (stat.mtime.nanoseconds >= mtime.nanoseconds and !self.created) {
             return;
         }
     }
 
-    if (!self.modifiers.use_real_timestamps_and_ids) {
-        gid = 0;
-        uid = 0;
-        mtime = 0;
+    if (self.modifiers.use_real_timestamps_and_ids) {
+        mtime = raw_mtime;
+
+        // set the mode, uid, and gid if possible
+        switch (builtin.os.tag) {
+            .linux => {
+                mode = @intCast(file_stats.permissions.toMode());
+                var statx = std.mem.zeroes(std.os.linux.Statx);
+                // TODO: is this the way you're supposed to do it?
+                switch (std.os.linux.errno(std.os.linux.statx(file.handle, "", std.os.linux.AT.EMPTY_PATH, .{ .UID = true, .GID = true }, &statx))) {
+                    .SUCCESS => {
+                        uid = statx.uid;
+                        gid = statx.gid;
+                    },
+                    else => {}
+                }
+            },
+            else => {}
+        }
+    } else {
         // Even though it's not documented - in deterministic mode permissions are always set to:
         // https://github.com/llvm-mirror/llvm/blob/2c4ca6832fa6b306ee6a7010bfb80a3f2596f824/include/llvm/Object/ArchiveWriter.h#L27
         // https://github.com/llvm-mirror/llvm/blob/2c4ca6832fa6b306ee6a7010bfb80a3f2596f824/lib/Object/ArchiveWriter.cpp#L105
         mode = 644;
     }
 
-    const timestamp = @as(u128, @intCast(@divFloor(mtime, std.time.ns_per_s)));
+    const timestamp: u128 = @as(u128, @intCast(mtime.toSeconds()));
 
     // Extract critical error from error set - so IO errors can be handled seperately
-    const bytes = try file.readToEndAllocOptions(allocator, std.math.maxInt(usize), size, std.mem.Alignment.of(u64), null);
+    //const bytes = try file.readToEndAllocOptions(allocator, std.math.maxInt(usize), size, std.mem.Alignment.of(u64), null);
+    var rem_reader = file.reader(self.zar_io.io, &.{});
+    const bytes = try rem_reader.interface.allocRemainingAlignedSentinel(allocator, .unlimited, std.mem.Alignment.of(u64), null);
     var archived_file = ArchivedFile{ // was var
         .name = try allocator.dupe(u8, std.fs.path.basename(file_name)),
         .contents = Contents{
@@ -1076,30 +1081,32 @@ fn insertFile(self: *Archive, allocator: Allocator, file_name: []const u8) !void
     }
 }
 
-const RootError = error{ ReadFailed, Unseekable, Unexpected, AccessDenied };
+const RootError = error{ ReadFailed, Canceled, Unseekable, Unexpected, AccessDenied };
 
-fn printArchiveReadError(zar_io: *const ZarIo, file_name: []const u8, root_err: RootError, file_reader: *const std.fs.File.Reader) void {
-    const err = if (file_reader.err) |err| err else root_err;
-    switch (err) {
-        error.InputOutput,
-        error.SystemResources,
-        error.IsDir,
-        error.OperationAborted,
-        error.BrokenPipe,
-        error.ConnectionResetByPeer,
-        error.ConnectionTimedOut,
-        error.NotOpenForReading,
-        error.SocketNotConnected,
-        error.WouldBlock,
-        error.Canceled,
-        error.AccessDenied,
-        error.ProcessNotFound,
-        error.LockViolation,
-        error.Unexpected,
-        error.ReadFailed,
-        error.Unseekable,
-        => {}, // We just handle these errors generically
-    }
+fn printArchiveReadError(zar_io: *const ZarIo, file_name: []const u8, root_err: RootError, file_reader: *const std.Io.File.Reader) void {
+    _ = file_reader;
+    _ = root_err;
+    //const err = if (file_reader.err) |err| err else root_err;
+    //switch (err) { // FIXME: why does this switch only have one prong?
+    //    error.InputOutput,
+    //    error.SystemResources,
+    //    error.IsDir,
+    //    error.OperationAborted,
+    //    error.BrokenPipe,
+    //    error.ConnectionResetByPeer,
+    //    error.ConnectionTimedOut,
+    //    error.NotOpenForReading,
+    //    error.SocketNotConnected,
+    //    error.WouldBlock,
+    //    error.Canceled,
+    //    error.AccessDenied,
+    //    error.ProcessNotFound,
+    //    error.LockViolation,
+    //    error.Unexpected,
+    //    error.ReadFailed,
+    //    error.Unseekable,
+    //    => {}, // We just handle these errors generically
+    //}
     zar_io.printError("Failed to read archive {s}, an io error occured.", .{file_name});
 }
 
@@ -1113,7 +1120,7 @@ pub fn parse(self: *Archive) (ParseError || CriticalError)!void {
     const endianess = builtin.cpu.arch.endian();
 
     var reader_buffer: [archive_reader_buffer_size]u8 = undefined;
-    var file_reader = self.file.reader(&reader_buffer);
+    var file_reader = self.file.reader(self.zar_io.io, &reader_buffer);
     const reader = &file_reader.interface;
     {
         // Is the magic header found at the start of the archive?
@@ -1641,16 +1648,16 @@ pub fn parse(self: *Archive) (ParseError || CriticalError)!void {
 
         if (self.inferred_archive_type == .gnuthin) {
             // var thin_file = try handleFileIoError(self.zar_io, .opening, trimmed_archive_name, self.zar_io.cwd.openFile(trimmed_archive_name, .{}));
-            var thin_file = self.zar_io.cwd.openFile(trimmed_archive_name, .{}) catch {
+            var thin_file = self.zar_io.cwd.openFile(self.zar_io.io, trimmed_archive_name, .{}) catch {
                 // printArchiveOpenError();
                 // _ = err;
                 // TODO: handle error!
                 return error.TODO;
             };
-            defer thin_file.close();
+            defer thin_file.close(self.zar_io.io);
 
             var thin_file_reader_buffer: [archive_reader_buffer_size]u8 = undefined;
-            var thin_file_reader = thin_file.reader(&thin_file_reader_buffer);
+            var thin_file_reader = thin_file.reader(self.zar_io.io, &thin_file_reader_buffer);
             const thin_reader = &thin_file_reader.interface;
             thin_reader.readSliceAll(parsed_file.contents.bytes) catch |err| {
                 switch (err) {

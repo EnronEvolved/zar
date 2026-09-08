@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const trace = @import("tracy.zig").trace;
 const fs = std.fs;
-const io = std.io;
+// const io = std.io;
 const mem = std.mem;
 const process = std.process;
 
@@ -128,7 +128,7 @@ fn printArgumentError(zar_io: *const ZarIo, comptime format: []const u8, args: a
     printHelp(zar_io.stderr);
 }
 
-fn printHelp(stdout: *std.io.Writer) void {
+fn printHelp(stdout: *std.Io.Writer) void {
     _ = switch (mode) {
         .ar => stdout.print(zar_overview, .{}),
         .ranlib => stdout.print(ranlib_overview, .{}),
@@ -136,7 +136,7 @@ fn printHelp(stdout: *std.io.Writer) void {
     stdout.flush() catch {};
 }
 
-fn printVersion(stdout: *std.io.Writer) void {
+fn printVersion(stdout: *std.Io.Writer) void {
     const target = builtin.target;
     const default_archive_type = @tagName(Archive.getDefaultArchiveTypeFromHost());
     stdout.print(version_details, .{ @tagName(mode), version, @tagName(builtin.mode), default_archive_type, @tagName(target.cpu.arch), @tagName(target.os.tag), @tagName(target.abi) }) catch {};
@@ -157,15 +157,15 @@ fn checkOptionalArgsBounds(
     return true;
 }
 
-fn openOrCreateFile(zar_io: *const ZarIo, archive_path: []const u8, print_creation_warning: bool, created: *bool) !fs.File {
+fn openOrCreateFile(zar_io: *const ZarIo, archive_path: []const u8, print_creation_warning: bool, created: *bool) !std.Io.File {
     created.* = false;
-    const open_file_handle = zar_io.cwd.openFile(archive_path, .{ .mode = .read_write }) catch |err| switch (err) {
+    const open_file_handle = zar_io.cwd.openFile(zar_io.io, archive_path, .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => {
             created.* = true;
             if (print_creation_warning) {
                 zar_io.stdout.print("Creating new archive as none exists at path provided\n", .{}) catch {};
             }
-            const create_file_handle = try Archive.handleFileIoError(zar_io, .creating, archive_path, zar_io.cwd.createFile(archive_path, .{ .read = true }));
+            const create_file_handle = try Archive.handleFileIoError(zar_io, .creating, archive_path, zar_io.cwd.createFile(zar_io.io, archive_path, .{ .read = true }));
             return create_file_handle;
         },
         else => {
@@ -229,14 +229,22 @@ fn processModifier(zar_io: *const ZarIo, modifier_char: u8, modifiers: *Archive.
     return true;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
 
     defer stdout_writer.interface.flush() catch {};
     defer stderr_writer.interface.flush() catch {};
@@ -244,28 +252,25 @@ pub fn main() !void {
         const stdout = &stdout_writer.interface;
         const stderr = &stderr_writer.interface;
 
-        const stdout_config = std.io.tty.detectConfig(std.fs.File.stdout());
-        const stderr_config = std.io.tty.detectConfig(std.fs.File.stderr());
+        const stdout_config = try std.Io.Terminal.Mode.detect(io, std.Io.File.stdout(), false, false);
+        const stderr_config = try std.Io.Terminal.Mode.detect(io, std.Io.File.stderr(), false, false);
         break :zar_io .{
-            .cwd = fs.cwd(),
+            .io = io,
+            .cwd = std.Io.Dir.cwd(),
             .stdout = stdout,
-            .stdout_config = stdout_config,
+            .stdout_term = .{
+                .writer = stdout, 
+                .mode = stdout_config
+            },
             .stderr = stderr,
-            .stderr_config = stderr_config,
+            .stderr_term = .{
+                .writer = stderr,
+                .mode = stderr_config,
+            }
         };
     };
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const allocator = arena.allocator();
-    const args = process.argsAlloc(allocator) catch |err| {
-        switch (err) {
-            error.OutOfMemory => zar_io.printError("Internal allocation failed when parsing the command line arguments", .{}),
-            error.Overflow => zar_io.printError("Internal overflow error occurred when parsing the command line arguments", .{}),
-        }
-        return err;
-    };
+    const args = try init.args.toSlice(allocator);
 
     archiveMain(&zar_io, allocator, args) catch |err| {
         handleArchiveError(&zar_io, err) catch |e| if (debug_errors) {
@@ -485,7 +490,7 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
         .insert => {
             var created = false;
             const file = try openOrCreateFile(zar_io, archive_path, !modifiers.create, &created);
-            defer file.close();
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, created);
             defer archive.deinit();
@@ -496,7 +501,7 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
         .delete => {
             var created = false;
             const file = try openOrCreateFile(zar_io, archive_path, !modifiers.create, &created);
-            defer file.close();
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, created);
             defer archive.deinit();
@@ -505,8 +510,8 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
             try archive.flush();
         },
         .print_names => {
-            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(archive_path, .{}));
-            defer file.close();
+            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(zar_io.io, archive_path, .{}));
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, false);
             defer archive.deinit();
@@ -516,8 +521,8 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
             }
         },
         .print_contents => {
-            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(archive_path, .{}));
-            defer file.close();
+            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(zar_io.io, archive_path, .{}));
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, false);
             defer archive.deinit();
@@ -527,8 +532,8 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
             }
         },
         .print_symbols => {
-            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(archive_path, .{}));
-            defer file.close();
+            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(zar_io.io, archive_path, .{}));
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, false);
             defer archive.deinit();
@@ -548,7 +553,7 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
         .move => {
             var created = false;
             const file = try openOrCreateFile(zar_io, archive_path, !modifiers.create, &created);
-            defer file.close();
+            defer file.close(zar_io.io);
 
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, created);
             defer archive.deinit();
@@ -561,8 +566,8 @@ pub fn archiveMain(zar_io: *const ZarIo, allocator: anytype, args: []const []con
             return error.TODO; // #71
         },
         .ranlib => {
-            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(archive_path, .{ .mode = .read_write }));
-            defer file.close();
+            const file = try Archive.handleFileIoError(zar_io, .opening, archive_path, zar_io.cwd.openFile(zar_io.io, archive_path, .{ .mode = .read_write }));
+            defer file.close(zar_io.io);
             var archive = try Archive.init(allocator, zar_io, file, archive_path, archive_type, modifiers, false);
             defer archive.deinit();
             try archive.parse();
