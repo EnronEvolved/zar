@@ -1084,10 +1084,11 @@ fn insertFile(self: *Archive, allocator: Allocator, file_name: []const u8) !void
 const RootError = error{ ReadFailed, Canceled, Unseekable, Unexpected, AccessDenied };
 
 fn printArchiveReadError(zar_io: *const ZarIo, file_name: []const u8, root_err: RootError, file_reader: *const std.Io.File.Reader) void {
-    _ = file_reader;
-    _ = root_err;
-    //const err = if (file_reader.err) |err| err else root_err;
-    //switch (err) { // FIXME: why does this switch only have one prong?
+    //_ = file_reader;
+    //_ = root_err;
+    const err = if (file_reader.err) |err| err else root_err;
+    switch (err) {
+    // FIXME: why does this switch only have one prong?
     //    error.InputOutput,
     //    error.SystemResources,
     //    error.IsDir,
@@ -1106,7 +1107,8 @@ fn printArchiveReadError(zar_io: *const ZarIo, file_name: []const u8, root_err: 
     //    error.ReadFailed,
     //    error.Unseekable,
     //    => {}, // We just handle these errors generically
-    //}
+        else => {}
+    }
     zar_io.printError("Failed to read archive {s}, an io error occured.", .{file_name});
 }
 
