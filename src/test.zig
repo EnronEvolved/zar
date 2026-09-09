@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fs = std.fs;
-const io = std.io;
+//const io = std.Io;
 const mem = std.mem;
 const testing = std.testing;
 const logger = std.log.scoped(.tests);
@@ -42,20 +42,22 @@ const invoke_zar_as_child_process = false;
 
 // TODO: sort these out :)
 
-const ChildProcessWorkaroundError = std.process.Child.RunError || std.os.windows.GetFinalPathNameByHandleError;
+const ChildProcessWorkaroundError = std.process.RunError;// || std.os.windows.GetFinalPathNameByHandleError;
 
 /// Workaround the fact https://github.com/ziglang/zig/issues/5190 isn't
 /// supported on windows.
 pub fn childProcessRunWorkaround(args: struct {
     allocator: mem.Allocator,
+    io: std.Io,
     argv: []const []const u8,
-    cwd: ?[]const u8 = null,
-    cwd_dir: ?fs.Dir = null,
-    env_map: ?*const std.process.EnvMap = null,
-    max_output_bytes: usize = 50 * 1024,
-    expand_arg0: std.process.Child.Arg0Expand = .no_expand,
+    cwd: std.process.Child.Cwd = .inherit,
+    //cwd: ?[]const u8 = null,
+    //cwd_dir: ?std.Io.Dir = null,
+    env_map: ?*const std.process.Environ.Map = null,
+    max_output_bytes: std.Io.Limit = @enumFromInt(50 * 1024),
+    expand_arg0: std.process.ArgExpansion = .no_expand,
     progress_node: std.Progress.Node = std.Progress.Node.none,
-}) ChildProcessWorkaroundError!std.process.Child.RunResult {
+}) ChildProcessWorkaroundError!std.process.RunResult {
     var args_updated = args;
     defer if (builtin.os.tag == .windows and args.cwd_dir != null) {
         if (args_updated.cwd) |cwd| {
@@ -63,24 +65,27 @@ pub fn childProcessRunWorkaround(args: struct {
         }
     };
     if (builtin.os.tag == .windows) {
-        if (args.cwd_dir) |cwd_dir| {
-            args_updated.cwd_dir = null;
-            var dir_path_buffer: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
-            const dir_path_u16 = try std.os.windows.GetFinalPathNameByHandle(
-                cwd_dir.fd,
-                .{},
-                &dir_path_buffer,
-            );
-            args_updated.cwd = try std.unicode.wtf16LeToWtf8Alloc(args.allocator, dir_path_u16);
+        switch (args.cwd) {
+            .dir => |dir| {// args_updated.cwd_dir = null;
+                var dir_path_buffer: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
+                const dir_path_u16 = try std.os.windows.GetFinalPathNameByHandle(
+                    dir.fd,
+                    .{},
+                    &dir_path_buffer,
+                );
+                args_updated.cwd = .{ 
+                    .path = try std.unicode.wtf16LeToWtf8Alloc(args.allocator, dir_path_u16)
+                };
+            },
+            else => {}
         }
     }
-    return std.process.Child.run(.{
-        .allocator = args_updated.allocator,
+    return std.process.run(args_updated.allocator, args_updated.io, .{
         .argv = args_updated.argv,
         .cwd = args_updated.cwd,
-        .cwd_dir = args_updated.cwd_dir,
-        .env_map = args_updated.env_map,
-        .max_output_bytes = args_updated.max_output_bytes,
+        .environ_map = args_updated.env_map,
+        .stdout_limit = args_updated.max_output_bytes,
+        .stderr_limit = args_updated.max_output_bytes,
         .expand_arg0 = args_updated.expand_arg0,
         .progress_node = args_updated.progress_node,
     });
@@ -91,10 +96,11 @@ test "Test Argument Errors" {
         return;
     }
     const allocator = std.testing.allocator;
-    var test_dir_info = try TestDirInfo.getInfo();
-    defer test_dir_info.cleanup();
+    const io = std.testing.io;
+    var test_dir_info = try TestDirInfo.getInfo(io);
+    defer test_dir_info.cleanup(io);
 
-    var argv: std.ArrayList([]const u8) = .{};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
     {
@@ -103,7 +109,7 @@ test "Test Argument Errors" {
             .stderr = .{ .starts_with = "zar: error: An operation must be provided.\n" },
         };
 
-        try invokeZar(allocator, argv.items, test_dir_info, expected_out);
+        try invokeZar(allocator, io, argv.items, test_dir_info, expected_out);
     }
 
     {
@@ -113,7 +119,7 @@ test "Test Argument Errors" {
             .stderr = .{ .starts_with = "zar: error: 'j' is not a valid operation.\n" },
         };
 
-        try invokeZar(allocator, argv.items, test_dir_info, expected_out);
+        try invokeZar(allocator, io, argv.items, test_dir_info, expected_out);
     }
 
     {
@@ -123,7 +129,7 @@ test "Test Argument Errors" {
             .stderr = .{ .starts_with = "zar: error: 'j' is not a valid modifier.\n" },
         };
 
-        try invokeZar(allocator, argv.items, test_dir_info, expected_out);
+        try invokeZar(allocator, io, argv.items, test_dir_info, expected_out);
     }
 }
 
@@ -132,9 +138,10 @@ test "Test Archive Text Basic" {
     const test_names = [_][]const u8{ "input1.txt", "input2.txt" };
 
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var test1_dir = try fs.cwd().openDir(test_path, .{});
-    defer test1_dir.close();
+    var test1_dir = try std.Io.Dir.cwd().openDir(io, test_path, .{});
+    defer test1_dir.close(io);
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -150,7 +157,7 @@ test "Test Archive Text Basic" {
     }
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 test "Test Archive Text With Long Filenames" {
@@ -161,9 +168,10 @@ test "Test Archive Text With Long Filenames" {
     const test_names = [_][]const u8{ "input1.txt", "input2.txt", "input3_that_is_also_a_much_longer_file_name.txt", "input4_that_is_also_a_much_longer_file_name.txt" };
 
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var test_dir = try fs.cwd().openDir(test_path, .{});
-    defer test_dir.close();
+    var test_dir = try std.Io.Dir.cwd().openDir(io, test_path, .{});
+    defer test_dir.close(io);
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -179,16 +187,17 @@ test "Test Archive Text With Long Filenames" {
     }
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 test "Test MacOS aarch64" {
     const test_path = "test/data/test_macos_aarch64";
     const test_names = [_][]const u8{"a.o"};
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var test_dir = try fs.cwd().openDir(test_path, .{});
-    defer test_dir.close();
+    var test_dir = try std.Io.Dir.cwd().openDir(io, test_path, .{});
+    defer test_dir.close(io);
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -210,7 +219,7 @@ test "Test MacOS aarch64" {
             .operating_system = .macos,
         },
     };
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 test "Test Archive With Symbols Basic" {
@@ -218,6 +227,7 @@ test "Test Archive With Symbols Basic" {
     const dynamic_lib = "input2.so";
 
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -248,7 +258,7 @@ test "Test Archive With Symbols Basic" {
     }
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 test "Test Archive With Long Names And Symbols" {
@@ -259,6 +269,7 @@ test "Test Archive With Long Names And Symbols" {
         &[_][]const u8{ "input3_that_is_also_a_much_longer_file_name_symbol1", "input3_symbol2_that_is_also_longer_symbol", "input3_symbol3_that_is_also_longer_symbol" },
     };
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -281,7 +292,7 @@ test "Test Archive With Long Names And Symbols" {
     }
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 test "Test Archive Stress Test" {
@@ -293,6 +304,7 @@ test "Test Archive Stress Test" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const io = std.testing.io;
     try initialiseTestData(allocator, &object_names, &object_symbols, test6_symcount);
 
     var test_sequence: TestSequence = .{};
@@ -318,7 +330,7 @@ test "Test Archive Stress Test" {
     const testing_allocator = std.testing.allocator;
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(testing_allocator, execution_options);
+    try test_sequence.execute(testing_allocator, io, execution_options);
 }
 
 test "Test Archive Sorted" {
@@ -338,6 +350,7 @@ test "Test Archive Sorted" {
     };
 
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var test_sequence: TestSequence = .{};
     defer test_sequence.deinit(allocator);
@@ -372,7 +385,7 @@ test "Test Archive Sorted" {
     }
 
     const execution_options = TestSequence.ExecutionOptions.standardExecutionOptions();
-    try test_sequence.execute(allocator, execution_options);
+    try test_sequence.execute(allocator, io, execution_options);
 }
 
 const TestSequence = struct {
@@ -387,9 +400,9 @@ const TestSequence = struct {
 
     const TestOperation = union(enum) {
         const CopyTestFile = struct {
-            src_dir: fs.Dir,
+            src_dir: std.Io.Dir,
             file_name: []u8,
-            pub fn init(allocator: Allocator, src_dir: fs.Dir, file_name: []const u8) !CopyTestFile {
+            pub fn init(allocator: Allocator, src_dir: std.Io.Dir, file_name: []const u8) !CopyTestFile {
                 const owned_file_name = try allocator.alloc(u8, file_name.len);
                 @memcpy(owned_file_name, file_name);
                 errdefer allocator.free(owned_file_name);
@@ -523,12 +536,12 @@ const TestSequence = struct {
         copy_test_file: CopyTestFile,
     };
 
-    test_operations: std.ArrayList(TestOperation) = .{},
+    test_operations: std.ArrayList(TestOperation) = .empty,
 
     pub fn copyTestFile(
         test_sequence: *TestSequence,
         allocator: Allocator,
-        src_dir: std.fs.Dir,
+        src_dir: std.Io.Dir,
         file_name: []const u8,
     ) !void {
         const copy_test_file = try TestOperation.CopyTestFile.init(
@@ -586,14 +599,15 @@ const TestSequence = struct {
     pub fn execute(
         test_sequence: TestSequence,
         allocator: Allocator,
+        io: std.Io,
         execution_options: ExecutionOptions,
     ) !void {
         // TODO: get this from the execution options
         for (execution_options.targets) |target| {
-            var test_dir_info = try TestDirInfo.getInfo();
+            var test_dir_info = try TestDirInfo.getInfo(io);
             // if a test is going to fail anyway, this is a useful way to debug it for now..
             var cancel_cleanup = false;
-            defer if (!cancel_cleanup) test_dir_info.cleanup();
+            defer if (!cancel_cleanup) test_dir_info.cleanup(io);
             errdefer cancel_cleanup = true;
 
             const llvm_format_options = [_]LlvmFormat{ .implicit, target.operating_system.toDefaultLlvmFormat() };
@@ -612,6 +626,7 @@ const TestSequence = struct {
                             if (first_target_iter) {
                                 try generateCompiledFilesWithSymbols(
                                     allocator,
+                                    io,
                                     target,
                                     build_object_file.options.library_type,
                                     &[_][]const u8{build_object_file.object_name},
@@ -620,20 +635,20 @@ const TestSequence = struct {
                                 );
                             }
 
-                            try test_dir_info.tmp_dir.dir.copyFile(build_object_file.object_name, test_dir_info.zar_wd, build_object_file.object_name, .{});
-                            try test_dir_info.tmp_dir.dir.copyFile(build_object_file.object_name, test_dir_info.llvm_ar_wd, build_object_file.object_name, .{});
+                            try test_dir_info.tmp_dir.dir.copyFile(build_object_file.object_name, test_dir_info.zar_wd, build_object_file.object_name, io, .{});
+                            try test_dir_info.tmp_dir.dir.copyFile(build_object_file.object_name, test_dir_info.llvm_ar_wd, build_object_file.object_name, io, .{});
                         },
                         .test_archive_operation => |*test_archive_operation| {
                             try compareArchivers(test_archive_operation.getArchiveArguments(llvm_format_option), test_dir_info);
                         },
                         .copy_test_file => |copy_test_file| {
-                            try copy_test_file.src_dir.copyFile(copy_test_file.file_name, test_dir_info.llvm_ar_wd, copy_test_file.file_name, .{});
-                            try copy_test_file.src_dir.copyFile(copy_test_file.file_name, test_dir_info.zar_wd, copy_test_file.file_name, .{});
+                            try copy_test_file.src_dir.copyFile(copy_test_file.file_name, test_dir_info.llvm_ar_wd, copy_test_file.file_name, io, .{});
+                            try copy_test_file.src_dir.copyFile(copy_test_file.file_name, test_dir_info.zar_wd, copy_test_file.file_name, io, .{});
                         },
                     }
                 }
                 if (!cancel_cleanup) {
-                    test_dir_info.resetArchiveDirs() catch |err| {
+                    test_dir_info.resetArchiveDirs(io) catch |err| {
                         logger.err("Failed to reset archive dirs test for target ({s}): {}", .{ target.targetToArgument(), err });
                         // return @errorCast(err);
                         cancel_cleanup = true;
@@ -739,11 +754,11 @@ const LlvmFormat = enum {
 
 const TestDirInfo = struct {
     tmp_dir: std.testing.TmpDir,
-    zar_wd: std.fs.Dir,
-    llvm_ar_wd: std.fs.Dir,
+    zar_wd: std.Io.Dir,
+    llvm_ar_wd: std.Io.Dir,
     cwd: []const u8,
 
-    pub fn getInfo() !TestDirInfo {
+    pub fn getInfo(io: std.Io) !TestDirInfo {
         var result: TestDirInfo = .{
             .tmp_dir = std.testing.tmpDir(.{}),
             .cwd = undefined,
@@ -752,11 +767,11 @@ const TestDirInfo = struct {
         };
         errdefer result.tmp_dir.cleanup();
 
-        result.zar_wd = try result.tmp_dir.dir.makeOpenPath("zar_wd", .{ .iterate = true });
-        errdefer result.zar_wd.close();
+        result.zar_wd = try result.tmp_dir.dir.createDirPathOpen(io, "zar_wd", .{ .open_options = .{ .iterate = true } });
+        errdefer result.zar_wd.close(io);
 
-        result.llvm_ar_wd = try result.tmp_dir.dir.makeOpenPath("llvm_ar_wd", .{ .iterate = true });
-        errdefer result.llvm_ar_wd.close();
+        result.llvm_ar_wd = try result.tmp_dir.dir.createDirPathOpen(io, "llvm_ar_wd", .{ .open_options = .{ .iterate = true } });
+        errdefer result.llvm_ar_wd.close(io);
 
         result.cwd = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
             ".zig-cache", "tmp", &result.tmp_dir.sub_path,
@@ -764,22 +779,22 @@ const TestDirInfo = struct {
         return result;
     }
 
-    pub fn resetArchiveDirs(self: *TestDirInfo) !void {
-        self.zar_wd.close();
-        self.llvm_ar_wd.close();
-        try self.tmp_dir.dir.deleteTree("zar_wd");
-        try self.tmp_dir.dir.deleteTree("llvm_ar_wd");
+    pub fn resetArchiveDirs(self: *TestDirInfo, io: std.Io) !void {
+        self.zar_wd.close(io);
+        self.llvm_ar_wd.close(io);
+        try self.tmp_dir.dir.deleteTree(io, "zar_wd");
+        try self.tmp_dir.dir.deleteTree(io, "llvm_ar_wd");
 
-        self.zar_wd = try self.tmp_dir.dir.makeOpenPath("zar_wd", .{ .iterate = true });
-        errdefer self.zar_wd.close();
+        self.zar_wd = try self.tmp_dir.dir.createDirPathOpen(io, "zar_wd", .{ .open_options = .{ .iterate = true } });
+        errdefer self.zar_wd.close(io);
 
-        self.llvm_ar_wd = try self.tmp_dir.dir.makeOpenPath("llvm_ar_wd", .{ .iterate = true });
-        errdefer self.llvm_ar_wd.close();
+        self.llvm_ar_wd = try self.tmp_dir.dir.createDirPathOpen(io, "llvm_ar_wd", .{ .open_options = .{ .iterate = true } });
+        errdefer self.llvm_ar_wd.close(io);
     }
 
-    pub fn cleanup(self: *TestDirInfo) void {
-        self.zar_wd.close();
-        self.llvm_ar_wd.close();
+    pub fn cleanup(self: *TestDirInfo, io: std.Io) void {
+        self.zar_wd.close(io);
+        self.llvm_ar_wd.close(io);
         self.tmp_dir.cleanup();
         std.testing.allocator.free(self.cwd);
     }
@@ -789,17 +804,18 @@ fn compareGeneratedArchives(test_dir_info: TestDirInfo) !void {
     const tracy = trace(@src());
     defer tracy.end();
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var walker = try test_dir_info.llvm_ar_wd.walk(allocator);
     defer walker.deinit();
-    while (try walker.next()) |walk| {
-        const llvm_ar_file_handle = try test_dir_info.llvm_ar_wd.openFile(walk.path, .{ .mode = .read_only });
-        defer llvm_ar_file_handle.close();
-        const zig_ar_file_handle = try test_dir_info.zar_wd.openFile(walk.path, .{ .mode = .read_only });
-        defer zig_ar_file_handle.close();
+    while (try walker.next(io)) |walk| {
+        const llvm_ar_file_handle = try test_dir_info.llvm_ar_wd.openFile(io, walk.path, .{ .mode = .read_only });
+        defer llvm_ar_file_handle.close(io);
+        const zig_ar_file_handle = try test_dir_info.zar_wd.openFile(io, walk.path, .{ .mode = .read_only });
+        defer zig_ar_file_handle.close(io);
 
-        const llvm_ar_stat = try llvm_ar_file_handle.stat();
-        const zig_ar_stat = try zig_ar_file_handle.stat();
+        const llvm_ar_stat = try llvm_ar_file_handle.stat(io);
+        const zig_ar_stat = try zig_ar_file_handle.stat(io);
 
         try testing.expectEqual(llvm_ar_stat.size, zig_ar_stat.size);
 
@@ -809,13 +825,15 @@ fn compareGeneratedArchives(test_dir_info: TestDirInfo) !void {
         defer allocator.free(zig_ar_buffer);
 
         {
-            const llvm_ar_read = try llvm_ar_file_handle.preadAll(llvm_ar_buffer, 0);
+            var llvm_reader = llvm_ar_file_handle.reader(io, &.{}).interface;
+            const llvm_ar_read = try llvm_reader.readSliceShort(llvm_ar_buffer);
             try testing.expectEqual(llvm_ar_read, llvm_ar_stat.size);
         }
 
         {
-            const zig_ar_read = try zig_ar_file_handle.preadAll(zig_ar_buffer, 0);
-            try testing.expectEqual(zig_ar_read, zig_ar_stat.size);
+            var zar_reader = zig_ar_file_handle.reader(io, &.{}).interface;
+            const zar_read = try zar_reader.readSliceShort(zig_ar_buffer);
+            try testing.expectEqual(zar_read, zig_ar_stat.size);
         }
 
         for (llvm_ar_buffer, 0..) |llvm_ar_byte, index| {
@@ -859,12 +877,12 @@ const ExpectedOut = struct {
     stderr: Comparison = .none,
 };
 
-fn invokeZar(allocator: mem.Allocator, arguments: []const []const u8, test_dir_info: TestDirInfo, expected_out: ExpectedOut) !void {
+fn invokeZar(allocator: mem.Allocator, io: std.Io, arguments: []const []const u8, test_dir_info: TestDirInfo, expected_out: ExpectedOut) !void {
     errdefer |err| {
         logger.err("test failure: {}", .{err});
     }
 
-    var argv: std.ArrayList([]const u8) = .{};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, build_options.zar_exe_path);
     try argv.appendSlice(allocator, arguments);
@@ -882,8 +900,9 @@ fn invokeZar(allocator: mem.Allocator, arguments: []const []const u8, test_dir_i
         }
         const result = try childProcessRunWorkaround(.{
             .allocator = allocator,
+            .io = io,
             .argv = argv.items,
-            .cwd_dir = test_dir_info.zar_wd,
+            .cwd = .{ .dir = test_dir_info.zar_wd },
         });
 
         defer {
@@ -895,8 +914,8 @@ fn invokeZar(allocator: mem.Allocator, arguments: []const []const u8, test_dir_i
     } else {
         // Should we pre-allocate this memory based on the input std in/out buffers?
         // (and then error if it overflows?)
-        var stdout_writer = std.io.Writer.Allocating.init(allocator);
-        var stderr_writer = std.io.Writer.Allocating.init(allocator);
+        var stdout_writer = std.Io.Writer.Allocating.init(allocator);
+        var stderr_writer = std.Io.Writer.Allocating.init(allocator);
 
         defer {
             stdout_writer.deinit();
@@ -907,14 +926,21 @@ fn invokeZar(allocator: mem.Allocator, arguments: []const []const u8, test_dir_i
             const stdout = &stdout_writer.writer;
             const stderr = &stderr_writer.writer;
 
-            const stdout_config: std.io.tty.Config = .no_color;
-            const stderr_config: std.io.tty.Config = .no_color;
+            const stdout_config: std.Io.Terminal.Mode = .no_color;
+            const stderr_config: std.Io.Terminal.Mode = .no_color;
             break :zar_io .{
+                .io = io,
                 .cwd = test_dir_info.zar_wd,
                 .stdout = stdout,
-                .stdout_config = stdout_config,
+                .stdout_term = .{
+                    .writer = stdout, 
+                    .mode = stdout_config
+                },
                 .stderr = stderr,
-                .stderr_config = stderr_config,
+                .stderr_term = .{
+                    .writer = stderr,
+                    .mode = stderr_config,
+                }
             };
         };
 
@@ -945,11 +971,12 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
         }
     }
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const llvm_run_result = llvm_run_result: {
         const tracy = traceNamed(@src(), "llvm ar");
         defer tracy.end();
-        var argv: std.ArrayList([]const u8) = .{};
+        var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
         try argv.append(allocator, build_options.zig_exe_path);
@@ -958,9 +985,10 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
 
         const result = try childProcessRunWorkaround(.{
             .allocator = allocator,
+            .io = io,
             .argv = argv.items,
-            .cwd_dir = test_dir_info.llvm_ar_wd,
-            .max_output_bytes = 100 * 1024,
+            .cwd = .{ .dir = test_dir_info.llvm_ar_wd },
+            .max_output_bytes = @enumFromInt(100 * 1024),
         });
         break :llvm_run_result result;
     };
@@ -969,7 +997,7 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
         allocator.free(llvm_run_result.stdout);
         allocator.free(llvm_run_result.stderr);
     }
-    try invokeZar(allocator, arguments, test_dir_info, .{
+    try invokeZar(allocator, io, arguments, test_dir_info, .{
         .stderr = .{ .matches = llvm_run_result.stderr },
         .stdout = .{ .matches = llvm_run_result.stdout },
     });
@@ -978,6 +1006,7 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
 
 fn generateCompiledFilesWithSymbols(
     framework_allocator: Allocator,
+    io: std.Io,
     target: Target,
     libary_type: LibraryType,
     file_names: []const []const u8,
@@ -991,7 +1020,7 @@ fn generateCompiledFilesWithSymbols(
     const child_processes = try framework_allocator.alloc(std.process.Child, worker_count);
     defer framework_allocator.free(child_processes);
 
-    var argv: std.ArrayList([]const u8) = .{};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(framework_allocator);
     try argv.ensureUnusedCapacity(framework_allocator, 7);
     argv.appendAssumeCapacity(build_options.zig_exe_path);
@@ -1014,17 +1043,17 @@ fn generateCompiledFilesWithSymbols(
         const process_index = @mod(index, child_processes.len);
         if (index >= child_processes.len) {
             // TODO: read results etc. and fail tests with appropriate diagnostics if these didn't run properly
-            _ = try child_processes[process_index].wait();
+            _ = try child_processes[process_index].wait(io);
         }
 
         const source_file_name = try std.fmt.allocPrint(framework_allocator, "{s}.c", .{file_name});
         defer framework_allocator.free(source_file_name);
         {
-            const source_file = try test_dir_info.tmp_dir.dir.createFile(source_file_name, .{});
-            defer source_file.close();
+            const source_file = try test_dir_info.tmp_dir.dir.createFile(io, source_file_name, .{});
+            defer source_file.close(io);
 
             var writer_buf: [4096]u8 = undefined;
-            var file_writer = source_file.writer(&writer_buf);
+            var file_writer = source_file.writer(io, &writer_buf);
             var writer = &file_writer.interface;
             for (file_symbols) |symbol| {
                 try writer.print("extern int {s}(int a) {{ return a; }}\n", .{symbol});
@@ -1035,23 +1064,27 @@ fn generateCompiledFilesWithSymbols(
         argv.items[file_name_arg] = file_name;
         argv.items[source_name_arg] = source_file_name;
 
-        child_processes[process_index] = std.process.Child.init(argv.items, framework_allocator);
+        //child_processes[process_index] = std.process.Child.init(argv.items, framework_allocator);
         // TODO: make this use cwd_dir when supported on Windows
-        child_processes[process_index].cwd = test_dir_info.cwd;
-        try child_processes[process_index].spawn();
+        //child_processes[process_index].cwd = test_dir_info.cwd;
+        //try child_processes[process_index].spawn();
+        child_processes[process_index] = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = test_dir_info.cwd }
+        });
     }
 
     {
         var process_index: u32 = 0;
         while (process_index < symbol_names.len and process_index < child_processes.len) {
             // TODO: read results etc.
-            _ = try child_processes[process_index].wait();
+            _ = try child_processes[process_index].wait(io);
             process_index += 1;
         }
     }
 
     for (file_names) |file_name| {
-        try test_dir_info.tmp_dir.dir.copyFile(file_name, test_dir_info.zar_wd, file_name, .{});
-        try test_dir_info.tmp_dir.dir.copyFile(file_name, test_dir_info.llvm_ar_wd, file_name, .{});
+        try test_dir_info.tmp_dir.dir.copyFile(file_name, test_dir_info.zar_wd, file_name, io, .{});
+        try test_dir_info.tmp_dir.dir.copyFile(file_name, test_dir_info.llvm_ar_wd, file_name, io, .{});
     }
 }

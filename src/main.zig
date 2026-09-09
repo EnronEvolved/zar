@@ -243,28 +243,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
+    const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
+    var zar_io: ZarIo = undefined;
+    if (false) {
+    zar_io = try ZarIo.init(io, std.Io.Dir.cwd(), stdout, stderr, .{
+        .stdout = .{ .buf = &stdout_buf },
+        .stderr = .{ .buf = &stderr_buf },
+    });
+    defer zar_io.deinit();
+    }
+    var stdout_writer = stdout.writer(io, &stdout_buf);
+    var stderr_writer = stderr.writer(io, &stderr_buf);
 
     defer stdout_writer.interface.flush() catch {};
     defer stderr_writer.interface.flush() catch {};
-    const zar_io: ZarIo = zar_io: {
-        const stdout = &stdout_writer.interface;
-        const stderr = &stderr_writer.interface;
+    zar_io = zar_io: {
+        const stdout_if = &stdout_writer.interface;
+        const stderr_if = &stderr_writer.interface;
 
-        const stdout_config = try std.Io.Terminal.Mode.detect(io, std.Io.File.stdout(), false, false);
-        const stderr_config = try std.Io.Terminal.Mode.detect(io, std.Io.File.stderr(), false, false);
+        const stdout_config = try std.Io.Terminal.Mode.detect(io, stdout, false, false);
+        const stderr_config = try std.Io.Terminal.Mode.detect(io, stderr, false, false);
         break :zar_io .{
             .io = io,
             .cwd = std.Io.Dir.cwd(),
-            .stdout = stdout,
+            .stdout = stdout_if,
             .stdout_term = .{
-                .writer = stdout, 
+                .writer = stdout_if, 
                 .mode = stdout_config
             },
-            .stderr = stderr,
+            .stderr = stderr_if,
             .stderr_term = .{
-                .writer = stderr,
+                .writer = stderr_if,
                 .mode = stderr_config,
             }
         };
