@@ -98,7 +98,7 @@ test "Test Argument Errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var test_dir_info = try TestDirInfo.getInfo(allocator, io);
-    defer test_dir_info.cleanup(allocator, io);
+    defer test_dir_info.cleanup(allocator, io, false);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -607,7 +607,7 @@ const TestSequence = struct {
             var test_dir_info = try TestDirInfo.getInfo(allocator, io);
             // if a test is going to fail anyway, this is a useful way to debug it for now..
             var cancel_cleanup = false;
-            defer if (!cancel_cleanup) test_dir_info.cleanup(allocator, io);
+            defer test_dir_info.cleanup(allocator, io, !cancel_cleanup);
             errdefer cancel_cleanup = true;
 
             const llvm_format_options = [_]LlvmFormat{ .implicit, target.operating_system.toDefaultLlvmFormat() };
@@ -792,10 +792,12 @@ const TestDirInfo = struct {
         errdefer self.llvm_ar_wd.close(io);
     }
 
-    pub fn cleanup(self: *TestDirInfo, alloc: std.mem.Allocator, io: std.Io) void {
+    pub fn cleanup(self: *TestDirInfo, alloc: std.mem.Allocator, io: std.Io, clean_tmp_dir: bool) void {
         self.zar_wd.close(io);
         self.llvm_ar_wd.close(io);
-        self.tmp_dir.cleanup();
+        if (clean_tmp_dir) {
+            self.tmp_dir.cleanup();
+        }
         alloc.free(self.cwd);
     }
 };
