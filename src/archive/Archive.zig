@@ -805,6 +805,12 @@ pub fn extract(self: *Archive, file_names: []const []const u8) !void {
     }
 }
 
+fn isMachOSym(sym: std.macho.nlist_64) bool {
+    // old: sym.ext() and (sym.sect() or sym.tentative())
+    // tentative new: sym.n_type.bits.ext and (sym.n_type.bits.type == .sect or sym.tentative())
+    return sym.n_type.bits.ext and (sym.n_type.bits.type == .sect or sym.tentative());
+}
+
 pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *const ArchivedFile, file_index: usize) (CriticalError || SymbolParseError )!void {
     const magic = archived_file.contents.bytes[0..4];
 
@@ -915,7 +921,7 @@ pub fn addToSymbolTable(self: *Archive, allocator: Allocator, archived_file: *co
                         const symtab_buffer = archived_file.contents.bytes[symtab_command.symoff..][0 .. symtab_command.nsyms * @sizeOf(std.macho.nlist_64)];
                         const symtab = @as([*]align(1) const std.macho.nlist_64, @ptrCast(symtab_buffer.ptr))[0..symtab_command.nsyms];
                         for (symtab) |sym| {
-                            if (sym.n_type.bits.ext and (sym.n_type.bits.type == .sect or sym.tentative())) {
+                            if (isMachOSym(sym)) {
                                 const string = std.mem.sliceTo(strtab[sym.n_strx..], 0);
                                 const symbol = Symbol{
                                     .name = try allocator.dupe(u8, string),
