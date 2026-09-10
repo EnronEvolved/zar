@@ -97,8 +97,8 @@ test "Test Argument Errors" {
     }
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var test_dir_info = try TestDirInfo.getInfo(io);
-    defer test_dir_info.cleanup(io);
+    var test_dir_info = try TestDirInfo.getInfo(allocator, io);
+    defer test_dir_info.cleanup(allocator, io);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -604,10 +604,10 @@ const TestSequence = struct {
     ) !void {
         // TODO: get this from the execution options
         for (execution_options.targets) |target| {
-            var test_dir_info = try TestDirInfo.getInfo(io);
+            var test_dir_info = try TestDirInfo.getInfo(allocator, io);
             // if a test is going to fail anyway, this is a useful way to debug it for now..
             var cancel_cleanup = false;
-            defer if (!cancel_cleanup) test_dir_info.cleanup(io);
+            defer if (!cancel_cleanup) test_dir_info.cleanup(allocator, io);
             errdefer cancel_cleanup = true;
 
             const llvm_format_options = [_]LlvmFormat{ .implicit, target.operating_system.toDefaultLlvmFormat() };
@@ -639,7 +639,7 @@ const TestSequence = struct {
                             try test_dir_info.tmp_dir.dir.copyFile(build_object_file.object_name, test_dir_info.llvm_ar_wd, build_object_file.object_name, io, .{});
                         },
                         .test_archive_operation => |*test_archive_operation| {
-                            try compareArchivers(test_archive_operation.getArchiveArguments(llvm_format_option), test_dir_info);
+                            try compareArchivers(test_archive_operation.getArchiveArguments(llvm_format_option), test_dir_info, allocator, io);
                         },
                         .copy_test_file => |copy_test_file| {
                             try copy_test_file.src_dir.copyFile(copy_test_file.file_name, test_dir_info.llvm_ar_wd, copy_test_file.file_name, io, .{});
@@ -758,7 +758,7 @@ const TestDirInfo = struct {
     llvm_ar_wd: std.Io.Dir,
     cwd: []const u8,
 
-    pub fn getInfo(io: std.Io) !TestDirInfo {
+    pub fn getInfo(alloc: std.mem.Allocator, io: std.Io) !TestDirInfo {
         var result: TestDirInfo = .{
             .tmp_dir = std.testing.tmpDir(.{}),
             .cwd = undefined,
@@ -773,7 +773,7 @@ const TestDirInfo = struct {
         result.llvm_ar_wd = try result.tmp_dir.dir.createDirPathOpen(io, "llvm_ar_wd", .{ .open_options = .{ .iterate = true } });
         errdefer result.llvm_ar_wd.close(io);
 
-        result.cwd = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        result.cwd = try std.fs.path.join(alloc, &[_][]const u8{
             ".zig-cache", "tmp", &result.tmp_dir.sub_path,
         });
         return result;
@@ -792,19 +792,17 @@ const TestDirInfo = struct {
         errdefer self.llvm_ar_wd.close(io);
     }
 
-    pub fn cleanup(self: *TestDirInfo, io: std.Io) void {
+    pub fn cleanup(self: *TestDirInfo, alloc: std.mem.Allocator, io: std.Io) void {
         self.zar_wd.close(io);
         self.llvm_ar_wd.close(io);
         self.tmp_dir.cleanup();
-        std.testing.allocator.free(self.cwd);
+        alloc.free(self.cwd);
     }
 };
 
-fn compareGeneratedArchives(test_dir_info: TestDirInfo) !void {
+fn compareGeneratedArchives(test_dir_info: TestDirInfo, allocator: std.mem.Allocator, io: std.Io) !void {
     const tracy = trace(@src());
     defer tracy.end();
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     var walker = try test_dir_info.llvm_ar_wd.walk(allocator);
     defer walker.deinit();
@@ -825,15 +823,19 @@ fn compareGeneratedArchives(test_dir_info: TestDirInfo) !void {
         defer allocator.free(zig_ar_buffer);
 
         {
-            var llvm_reader = llvm_ar_file_handle.reader(io, &.{}).interface;
-            const llvm_ar_read = try llvm_reader.readSliceShort(llvm_ar_buffer);
-            try testing.expectEqual(llvm_ar_read, llvm_ar_stat.size);
+            var llvm_rbuf: [4096]u8 = undefined;
+            var llvm_reader = llvm_ar_file_handle.reader(io, &llvm_rbuf);
+            try llvm_reader.seekTo(0);
+            try llvm_reader.interface.readSliceAll(llvm_ar_buffer);
+            try testing.expect(llvm_reader.atEnd());
         }
 
         {
-            var zar_reader = zig_ar_file_handle.reader(io, &.{}).interface;
-            const zar_read = try zar_reader.readSliceShort(zig_ar_buffer);
-            try testing.expectEqual(zar_read, zig_ar_stat.size);
+            var zar_rbuf: [4096]u8 = undefined;
+            var zar_reader = zig_ar_file_handle.reader(io, &zar_rbuf);
+            try zar_reader.seekTo(0);
+            try zar_reader.interface.readSliceAll(zig_ar_buffer);
+            try testing.expect(zar_reader.atEnd());
         }
 
         for (llvm_ar_buffer, 0..) |llvm_ar_byte, index| {
@@ -962,7 +964,7 @@ fn invokeZar(allocator: mem.Allocator, io: std.Io, arguments: []const []const u8
     }
 }
 
-fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !void {
+fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo, allocator: std.mem.Allocator, io: std.Io) !void {
     errdefer {
         // logger.err("Failure occured when comparing archivers with arguments: ({s})", .{arguments});
         logger.err("Failure occured when comparing archivers with arguments:", .{});
@@ -970,8 +972,6 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
             logger.err("{s}", .{argument});
         }
     }
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     const llvm_run_result = llvm_run_result: {
         const tracy = traceNamed(@src(), "llvm ar");
@@ -1001,7 +1001,7 @@ fn compareArchivers(arguments: []const []const u8, test_dir_info: TestDirInfo) !
         .stderr = .{ .matches = llvm_run_result.stderr },
         .stdout = .{ .matches = llvm_run_result.stdout },
     });
-    try compareGeneratedArchives(test_dir_info);
+    try compareGeneratedArchives(test_dir_info, allocator, io);
 }
 
 fn generateCompiledFilesWithSymbols(
