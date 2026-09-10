@@ -605,7 +605,7 @@ const TestSequence = struct {
         // TODO: get this from the execution options
         for (execution_options.targets) |target| {
             var test_dir_info = try TestDirInfo.getInfo(allocator, io);
-            // if a test is going to fail anyway, this is a useful way to debug it for now..
+            // enables inspection of files from failed tests.
             var cancel_cleanup = false;
             defer test_dir_info.cleanup(allocator, io, !cancel_cleanup);
             errdefer cancel_cleanup = true;
@@ -819,26 +819,23 @@ fn compareGeneratedArchives(test_dir_info: TestDirInfo, allocator: std.mem.Alloc
 
         try testing.expectEqual(llvm_ar_stat.size, zig_ar_stat.size);
 
-        const llvm_ar_buffer = try allocator.alloc(u8, llvm_ar_stat.size);
-        const zig_ar_buffer = try allocator.alloc(u8, zig_ar_stat.size);
+        var llvm_rbuf: [4096]u8 = undefined;
+        var llvm_reader = llvm_ar_file_handle.reader(io, &llvm_rbuf);
+
+        const llvm_ar_buffer: []u8 = try llvm_reader.interface.allocRemaining(
+            allocator, .unlimited
+        );
         defer allocator.free(llvm_ar_buffer);
+        try testing.expect(llvm_reader.atEnd());
+
+        var zar_rbuf: [4096]u8 = undefined;
+        var zar_reader = zig_ar_file_handle.reader(io, &zar_rbuf);
+
+        const zig_ar_buffer: []u8 = try zar_reader.interface.allocRemaining(
+            allocator, .unlimited
+        );
         defer allocator.free(zig_ar_buffer);
-
-        {
-            var llvm_rbuf: [4096]u8 = undefined;
-            var llvm_reader = llvm_ar_file_handle.reader(io, &llvm_rbuf);
-            try llvm_reader.seekTo(0);
-            try llvm_reader.interface.readSliceAll(llvm_ar_buffer);
-            try testing.expect(llvm_reader.atEnd());
-        }
-
-        {
-            var zar_rbuf: [4096]u8 = undefined;
-            var zar_reader = zig_ar_file_handle.reader(io, &zar_rbuf);
-            try zar_reader.seekTo(0);
-            try zar_reader.interface.readSliceAll(zig_ar_buffer);
-            try testing.expect(zar_reader.atEnd());
-        }
+        try testing.expect(zar_reader.atEnd());
 
         for (llvm_ar_buffer, 0..) |llvm_ar_byte, index| {
             const zig_ar_byte = zig_ar_buffer[index];
